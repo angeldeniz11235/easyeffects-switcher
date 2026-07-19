@@ -8,6 +8,7 @@ import subprocess
 import logging
 import dbus
 import threading
+import time
 from dbus.mainloop.glib import DBusGMainLoop
 from gi.repository import GLib
 
@@ -15,6 +16,7 @@ from gi.repository import GLib
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 MAPPINGS_FILE = os.path.join(BASE_DIR, "mappings.json")
 CACHE_FILE = os.path.join(BASE_DIR, "cache.json")
+STATUS_FILE = os.path.join(BASE_DIR, "status.json")
 AGY_PATH = "/home/wh0/.local/bin/agy"
 
 
@@ -127,6 +129,27 @@ def save_json(filepath, data):
             json.dump(data, f, indent=4)
     except Exception as e:
         logging.error(f"Error saving {filepath}: {e}")
+
+def save_status(player_name, metadata, preset_name, playback_status, media_type=None):
+    title = str(metadata.get("xesam:title", "")) if metadata else ""
+    album = str(metadata.get("xesam:album", "")) if metadata else ""
+    artists_dbus = metadata.get("xesam:artist", []) if metadata else []
+    artists = [str(a) for a in artists_dbus]
+    artist = ", ".join(artists) if artists else ""
+    url = str(metadata.get("xesam:url", "")) if metadata else ""
+    
+    status_data = {
+        "player": player_name if player_name else "",
+        "playback_status": playback_status,
+        "title": title,
+        "artist": artist,
+        "album": album,
+        "url": url,
+        "preset": preset_name if preset_name else "",
+        "media_type": media_type if media_type else "",
+        "updated_at": time.strftime("%Y-%m-%d %H:%M:%S")
+    }
+    save_json(STATUS_FILE, status_data)
 
 def get_mapping_override(artist, album, title):
     mappings = load_json(MAPPINGS_FILE, {"artists": {}, "albums": {}, "titles": {}})
@@ -433,6 +456,9 @@ def process_player_change_async(player_name, metadata, req_id):
     if not title and not artist:
         return
         
+    preset = None
+    media_type = None
+    
     if is_browser_player(player_name):
         title = clean_browser_title(title)
         logging.info(f"Processing browser player '{player_name}': {title} (Req: {req_id})")
@@ -456,33 +482,27 @@ def process_player_change_async(player_name, metadata, req_id):
         
         if media_type == "talk":
             logging.info("Applying talk preset for browser speech/podcast content.")
-            apply_easyeffects_preset("talk")
+            preset = "talk"
             
         elif media_type == "music":
             logging.info(f"Resolving music preset for browser music: '{title}' by '{artist}'")
             # 1. Check override mapping
             preset = get_mapping_override(artist, album, title)
-            if preset:
-                logging.info(f"Found manual override mapping for music: {preset}")
-                apply_easyeffects_preset(preset)
-                return
-
-            # 2. Lookup/Fetch genre-based preset (MusicBrainz + LLM fallback)
-            if req_id != player_request_ids.get(player_name) or player_name != active_player:
-                logging.info(f"Request {req_id} for '{player_name}' is obsolete. Skipping music genre lookup.")
-                return
-            preset = get_music_genre_preset(artist)
-            
-            # Verify if this is still the active request
-            if req_id != player_request_ids.get(player_name) or player_name != active_player:
-                logging.info(f"Request {req_id} for '{player_name}' is obsolete. Discarding preset '{preset}'.")
-                return
+            if not preset:
+                # 2. Lookup/Fetch genre-based preset (MusicBrainz + LLM fallback)
+                if req_id != player_request_ids.get(player_name) or player_name != active_player:
+                    logging.info(f"Request {req_id} for '{player_name}' is obsolete. Skipping music genre lookup.")
+                    return
+                preset = get_music_genre_preset(artist)
                 
-            if preset:
-                apply_easyeffects_preset(preset)
-            else:
-                logging.info(f"No specific preset matched. Falling back to default: {DEFAULT_PRESET}")
-                apply_easyeffects_preset(DEFAULT_PRESET)
+                # Verify if this is still the active request
+                if req_id != player_request_ids.get(player_name) or player_name != active_player:
+                    logging.info(f"Request {req_id} for '{player_name}' is obsolete. Discarding preset '{preset}'.")
+                    return
+                    
+                if not preset:
+                    logging.info(f"No specific preset matched. Falling back to default: {DEFAULT_PRESET}")
+                    preset = DEFAULT_PRESET
                 
         elif media_type == "movie":
             logging.info(f"Resolving movie preset for browser video: '{title}'")
@@ -494,11 +514,43 @@ def process_player_change_async(player_name, metadata, req_id):
             if not preset:
                 preset = get_mapping_override(None, None, title)
                 
-            if preset:
-                logging.info(f"Found manual override mapping for video: {preset}")
-                apply_easyeffects_preset(preset)
-                return
+            if not preset:
+                # 2. Query LLM to get genre
+                if req_id != player_request_ids.get(player_name) or player_name != active_player:
+                    logging.info(f"Request {req_id} for '{player_name}' is obsolete. Skipping movie genre lookup.")
+                    return
+                genre = query_llm_for_movie_genre(cleaned_title)
                 
+                # Verify if this is still the active request
+                if req_id != player_request_ids.get(player_name) or player_name != active_player:
+                    logging.info(f"Request {req_id} for '{player_name}' is obsolete. Discarding LLM result '{genre}'.")
+                    return
+                    
+                if genre and genre in MOVIE_GENRE_TO_PRESET:
+                    preset = MOVIE_GENRE_TO_PRESET[genre]
+                    logging.info(f"Mapped movie genre '{genre}' to preset: {preset}")
+                else:
+                    logging.info(f"Could not determine movie preset. Falling back to default: {DEFAULT_MOVIE_PRESET}")
+                    preset = DEFAULT_MOVIE_PRESET
+                
+        else:
+            logging.info(f"Unrecognized browser media type. Falling back to default: {DEFAULT_PRESET}")
+            preset = DEFAULT_PRESET
+            
+    elif is_video_player(player_name):
+        media_type = "movie"
+        logging.info(f"Processing video player '{player_name}': {title} (Req: {req_id})")
+        
+        # Clean title
+        cleaned_title = clean_video_title(title)
+        logging.info(f"Cleaned video title: '{cleaned_title}'")
+        
+        # 1. Check override mapping (using cleaned title and raw title)
+        preset = get_mapping_override(None, None, cleaned_title)
+        if not preset:
+            preset = get_mapping_override(None, None, title)
+            
+        if not preset:
             # 2. Query LLM to get genre
             if req_id != player_request_ids.get(player_name) or player_name != active_player:
                 logging.info(f"Request {req_id} for '{player_name}' is obsolete. Skipping movie genre lookup.")
@@ -513,79 +565,40 @@ def process_player_change_async(player_name, metadata, req_id):
             if genre and genre in MOVIE_GENRE_TO_PRESET:
                 preset = MOVIE_GENRE_TO_PRESET[genre]
                 logging.info(f"Mapped movie genre '{genre}' to preset: {preset}")
-                apply_easyeffects_preset(preset)
             else:
                 logging.info(f"Could not determine movie preset. Falling back to default: {DEFAULT_MOVIE_PRESET}")
-                apply_easyeffects_preset(DEFAULT_MOVIE_PRESET)
-                
-        else:
-            logging.info(f"Unrecognized browser media type. Falling back to default: {DEFAULT_PRESET}")
-            apply_easyeffects_preset(DEFAULT_PRESET)
-            
-    elif is_video_player(player_name):
-        logging.info(f"Processing video player '{player_name}': {title} (Req: {req_id})")
-        
-        # Clean title
-        cleaned_title = clean_video_title(title)
-        logging.info(f"Cleaned video title: '{cleaned_title}'")
-        
-        # 1. Check override mapping (using cleaned title and raw title)
-        preset = get_mapping_override(None, None, cleaned_title)
-        if not preset:
-            preset = get_mapping_override(None, None, title)
-            
-        if preset:
-            logging.info(f"Found manual override mapping for video: {preset}")
-            if req_id == player_request_ids.get(player_name) and player_name == active_player:
-                apply_easyeffects_preset(preset)
-            return
-            
-        # 2. Query LLM to get genre
-        if req_id != player_request_ids.get(player_name) or player_name != active_player:
-            logging.info(f"Request {req_id} for '{player_name}' is obsolete. Skipping movie genre lookup.")
-            return
-        genre = query_llm_for_movie_genre(cleaned_title)
-        
-        # Verify if this is still the active request
-        if req_id != player_request_ids.get(player_name) or player_name != active_player:
-            logging.info(f"Request {req_id} for '{player_name}' is obsolete. Discarding LLM result '{genre}'.")
-            return
-            
-        if genre and genre in MOVIE_GENRE_TO_PRESET:
-            preset = MOVIE_GENRE_TO_PRESET[genre]
-            logging.info(f"Mapped movie genre '{genre}' to preset: {preset}")
-            apply_easyeffects_preset(preset)
-        else:
-            logging.info(f"Could not determine movie preset. Falling back to default: {DEFAULT_MOVIE_PRESET}")
-            apply_easyeffects_preset(DEFAULT_MOVIE_PRESET)
+                preset = DEFAULT_MOVIE_PRESET
             
     else:
+        media_type = "music"
         logging.info(f"Processing music player '{player_name}': {title} by {artist} (Req: {req_id})")
         
         # 1. Check override mapping
         preset = get_mapping_override(artist, album, title)
-        if preset:
-            logging.info(f"Found manual override mapping for music: {preset}")
-            if req_id == player_request_ids.get(player_name) and player_name == active_player:
-                apply_easyeffects_preset(preset)
-            return
-
-        # 2. Lookup/Fetch genre-based preset (MusicBrainz + LLM fallback)
-        if req_id != player_request_ids.get(player_name) or player_name != active_player:
-            logging.info(f"Request {req_id} for '{player_name}' is obsolete. Skipping music genre lookup.")
-            return
-        preset = get_music_genre_preset(artist)
-        
-        # Verify if this is still the active request
-        if req_id != player_request_ids.get(player_name) or player_name != active_player:
-            logging.info(f"Request {req_id} for '{player_name}' is obsolete. Discarding preset '{preset}'.")
-            return
+        if not preset:
+            # 2. Lookup/Fetch genre-based preset (MusicBrainz + LLM fallback)
+            if req_id != player_request_ids.get(player_name) or player_name != active_player:
+                logging.info(f"Request {req_id} for '{player_name}' is obsolete. Skipping music genre lookup.")
+                return
+            preset = get_music_genre_preset(artist)
             
-        if preset:
-            apply_easyeffects_preset(preset)
-        else:
-            logging.info(f"No specific preset matched. Falling back to default: {DEFAULT_PRESET}")
-            apply_easyeffects_preset(DEFAULT_PRESET)
+            # Verify if this is still the active request
+            if req_id != player_request_ids.get(player_name) or player_name != active_player:
+                logging.info(f"Request {req_id} for '{player_name}' is obsolete. Discarding preset '{preset}'.")
+                return
+                
+            if not preset:
+                logging.info(f"No specific preset matched. Falling back to default: {DEFAULT_PRESET}")
+                preset = DEFAULT_PRESET
+
+    # Verify if this is still the active request before applying and saving status
+    if req_id != player_request_ids.get(player_name) or player_name != active_player:
+        logging.info(f"Request {req_id} for '{player_name}' is obsolete. Discarding final status save/apply.")
+        return
+
+    if preset:
+        apply_easyeffects_preset(preset)
+        save_status(player_name, metadata, preset, "Playing", media_type)
 
 def process_player_change(player_name, metadata):
     global player_request_ids
@@ -668,6 +681,11 @@ def handle_properties_changed(interface_name, changed_properties, invalidated_pr
                 if last_active_media != media_id:
                     last_active_media = media_id
                     process_player_change(active_player, players_state[active_player]["metadata"])
+                else:
+                    # Same media resumed playing, update status file without re-processing preset
+                    save_status(active_player, players_state[active_player]["metadata"], last_applied_preset, "Playing")
+            else:
+                save_status(active_player, players_state[active_player]["metadata"], last_applied_preset, players_state[active_player]["playback_status"])
 
 
 def handle_name_owner_changed(name, old_owner, new_owner):
@@ -689,6 +707,11 @@ def handle_name_owner_changed(name, old_owner, new_owner):
                         global last_active_media
                         last_active_media = media_id
                         process_player_change(active_player, players_state[active_player]["metadata"])
+                    elif players_state:
+                        active_player = list(players_state.keys())[0]
+                        save_status(active_player, players_state[active_player]["metadata"], last_applied_preset, players_state[active_player]["playback_status"])
+                    else:
+                        save_status(None, None, last_applied_preset, "Stopped")
         else:
             logging.info(f"Player '{player_name}' (owner: {new_owner}) registered.")
             sender_cache[new_owner] = player_name
@@ -735,6 +758,8 @@ def init_active_players(bus):
             global last_active_media
             last_active_media = media_id
             process_player_change(active_player, players_state[active_player]["metadata"])
+        else:
+            save_status(active_player, players_state.get(active_player, {}).get("metadata") if active_player else None, None, players_state.get(active_player, {}).get("playback_status", "Stopped") if active_player else "Stopped")
             
     except Exception as e:
         logging.error(f"Error initializing active players: {e}")
