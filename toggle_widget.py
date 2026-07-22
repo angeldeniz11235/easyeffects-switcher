@@ -59,7 +59,9 @@ class SwitcherToggleWidget(Gtk.Window):
         self.set_resizable(False)
         self.set_skip_taskbar_hint(True)
         self.set_skip_pager_hint(True)
+        self.set_keep_below(True) # Stay behind normal windows on desktop
         self.set_app_paintable(True)
+        self.connect("map-event", lambda w, e: self.set_keep_below(True))
         
         # Enable RGBA for visual matching Conky's ARGB visual
         screen = self.get_screen()
@@ -67,8 +69,8 @@ class SwitcherToggleWidget(Gtk.Window):
         if visual:
             self.set_visual(visual)
 
-        # Set dock / desktop type hint so it stays nicely on desktop like Conky
-        self.set_type_hint(Gdk.WindowTypeHint.DOCK)
+        # Set type hint to NORMAL (DOCK forces window to stay on top in some WMs)
+        self.set_type_hint(Gdk.WindowTypeHint.NORMAL)
 
         # Main Container VBox
         box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=0)
