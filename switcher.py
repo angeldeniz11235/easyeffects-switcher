@@ -17,6 +17,7 @@ BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 MAPPINGS_FILE = os.path.join(BASE_DIR, "mappings.json")
 CACHE_FILE = os.path.join(BASE_DIR, "cache.json")
 STATUS_FILE = os.path.join(BASE_DIR, "status.json")
+CONFIG_FILE = os.path.join(BASE_DIR, "config.json")
 AGY_PATH = "/home/wh0/.local/bin/agy"
 
 
@@ -111,7 +112,18 @@ active_player = None
 player_request_ids = {}
 last_applied_preset = None
 last_active_media = None
+last_enabled_state = True
 
+
+def is_enabled():
+    if not os.path.exists(CONFIG_FILE):
+        return True
+    try:
+        with open(CONFIG_FILE, "r") as f:
+            data = json.load(f)
+            return data.get("enabled", True)
+    except Exception:
+        return True
 
 def load_json(filepath, default):
     if not os.path.exists(filepath):
@@ -147,6 +159,7 @@ def save_status(player_name, metadata, preset_name, playback_status, media_type=
         "url": url,
         "preset": preset_name if preset_name else "",
         "media_type": media_type if media_type else "",
+        "enabled": is_enabled(),
         "updated_at": time.strftime("%Y-%m-%d %H:%M:%S")
     }
     save_json(STATUS_FILE, status_data)
@@ -426,6 +439,9 @@ def get_media_identifier(player_name, metadata):
 
 def apply_easyeffects_preset(preset_name):
     global last_applied_preset
+    if not is_enabled():
+        logging.info(f"[DISABLED] EasyEffects switcher is disabled. Skipping preset switch to '{preset_name}'.")
+        return
     if last_applied_preset == preset_name:
         logging.info(f"EasyEffects preset is already set to '{preset_name}'. Skipping application.")
         return
@@ -764,6 +780,24 @@ def init_active_players(bus):
     except Exception as e:
         logging.error(f"Error initializing active players: {e}")
 
+def check_config_loop():
+    global last_enabled_state, active_player, last_applied_preset
+    current_enabled = is_enabled()
+    if current_enabled != last_enabled_state:
+        logging.info(f"Switcher enabled state changed: {last_enabled_state} -> {current_enabled}")
+        last_enabled_state = current_enabled
+        if current_enabled and active_player and players_state.get(active_player, {}).get("playback_status") == "Playing":
+            metadata = players_state[active_player].get("metadata", {})
+            if metadata:
+                logging.info(f"Switcher toggled ON while media playing. Immediately applying preset for active player '{active_player}'.")
+                last_applied_preset = None
+                process_player_change(active_player, metadata)
+        else:
+            metadata = players_state.get(active_player, {}).get("metadata") if active_player else None
+            status = players_state.get(active_player, {}).get("playback_status", "Stopped") if active_player else "Stopped"
+            save_status(active_player, metadata, last_applied_preset, status)
+    return True
+
 def main():
     logging.info("Starting EasyEffects Multi-Player Switcher Daemon...")
     DBusGMainLoop(set_as_default=True)
@@ -787,6 +821,9 @@ def main():
     
     # Process currently playing media immediately on startup
     init_active_players(bus)
+
+    # Monitor config file periodically for live toggle updates
+    GLib.timeout_add_seconds(1, check_config_loop)
 
     # Enter main loop
     loop = GLib.MainLoop()
